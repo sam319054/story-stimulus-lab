@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PORT = 8000
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "saved_items")
 
 
