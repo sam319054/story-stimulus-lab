@@ -68,16 +68,103 @@ def parse_rss(xml_text: str) -> list[dict[str, str]]:
     return items
 
 
-def is_supabase_configured() -> bool:
-    return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SECRET_KEY"))
+def build_query_terms(query: str) -> list[str]:
+    collapsed = " ".join(query.split()).strip().lower()
+    if not collapsed:
+        return []
+
+    terms = [collapsed]
+    terms.extend(part for part in collapsed.split(" ") if len(part) > 1)
+    unique_terms: list[str] = []
+
+    for term in terms:
+        if term not in unique_terms:
+            unique_terms.append(term)
+
+    return unique_terms
+
+
+def score_news_item(item: dict[str, str], query_terms: list[str]) -> int:
+    haystack = " ".join(
+        [
+            item.get("title", ""),
+            item.get("summary", ""),
+            item.get("source", ""),
+        ]
+    ).lower()
+
+    score = 0
+    for index, term in enumerate(query_terms):
+        if term in haystack:
+            weight = 8 if index == 0 else 3
+            score += weight
+            if term in item.get("title", "").lower():
+                score += weight * 2
+
+    return score
+
+
+def filter_news_items(query: str, items: list[dict[str, str]]) -> list[dict[str, str]]:
+    query_terms = build_query_terms(query)
+    if not query_terms:
+        return items
+
+    scored_items: list[tuple[int, dict[str, str]]] = []
+    for item in items:
+        score = score_news_item(item, query_terms)
+        scored_items.append((score, item))
+
+    matched_items = [item for score, item in scored_items if score > 0]
+    if matched_items:
+        matched_items.sort(key=lambda entry: score_news_item(entry, query_terms), reverse=True)
+        return matched_items[:6]
+
+    return items[:6]
+
+
+def get_supabase_config() -> tuple[str, str]:
+    base_url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    secret_key = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+    return base_url, secret_key
+
+
+def get_supabase_status() -> dict[str, str | bool]:
+    base_url, secret_key = get_supabase_config()
+
+    if not base_url or not secret_key:
+        return {
+            "mode": "local",
+            "configured": False,
+            "ready": False,
+            "error": "Supabase 환경 변수가 비어 있습니다.",
+        }
+
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return {
+            "mode": "local",
+            "configured": True,
+            "ready": False,
+            "error": "SUPABASE_URL 값이 올바른 주소가 아닙니다.",
+        }
+
+    return {
+        "mode": "supabase",
+        "configured": True,
+        "ready": True,
+        "error": "",
+    }
+
+
+def is_supabase_ready() -> bool:
+    return bool(get_supabase_status()["ready"])
 
 
 def supabase_request(method: str, path: str, payload: dict | list | None = None) -> list | dict | None:
-    base_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
-    secret_key = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+    base_url, secret_key = get_supabase_config()
 
-    if not base_url or not secret_key:
-        raise RuntimeError("Supabase 환경 변수가 설정되지 않았습니다.")
+    if not is_supabase_ready():
+        raise RuntimeError(str(get_supabase_status()["error"]))
 
     data = None
     headers = {
@@ -164,7 +251,7 @@ def fetch_google_news(query: str) -> list[dict[str, str]]:
     with urllib.request.urlopen(request, timeout=12) as response:
         xml_text = response.read().decode("utf-8", errors="replace")
 
-    return parse_rss(xml_text)
+    return filter_news_items(query, parse_rss(xml_text))
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -179,13 +266,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/storage-status":
-            mode = "supabase" if is_supabase_configured() else "local"
-            self.send_json(
-                {
-                    "mode": mode,
-                    "configured": is_supabase_configured(),
-                }
-            )
+            self.send_json(get_supabase_status())
             return
 
         if parsed.path == "/api/news":
@@ -243,11 +324,11 @@ class AppHandler(SimpleHTTPRequestHandler):
             )
 
     def handle_saved_list(self) -> None:
-        if not is_supabase_configured():
+        if not is_supabase_ready():
             self.send_json(
                 {
                     "items": [],
-                    "error": "Supabase가 아직 연결되지 않았습니다.",
+                    "error": str(get_supabase_status()["error"]),
                 },
                 status=503,
             )
@@ -260,10 +341,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             self.send_json({"items": [], "error": str(error)}, status=502)
 
     def handle_saved_create(self) -> None:
-        if not is_supabase_configured():
+        if not is_supabase_ready():
             self.send_json(
                 {
-                    "error": "Supabase가 아직 연결되지 않았습니다.",
+                    "error": str(get_supabase_status()["error"]),
                 },
                 status=503,
             )
@@ -293,10 +374,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             self.send_json({"error": str(error)}, status=502)
 
     def handle_saved_delete(self, query_string: str) -> None:
-        if not is_supabase_configured():
+        if not is_supabase_ready():
             self.send_json(
                 {
-                    "error": "Supabase가 아직 연결되지 않았습니다.",
+                    "error": str(get_supabase_status()["error"]),
                 },
                 status=503,
             )
