@@ -12,6 +12,7 @@ const STORAGE_KEY = "story-stimulus-saved-items";
 
 let latestResultState = null;
 let storageMode = "local";
+let activeGenerationId = 0;
 
 const issuePatterns = [
   {
@@ -253,6 +254,11 @@ function buildCards(keyword, tone, format) {
 
   return [
     {
+      kicker: "Current Search",
+      title: `이번 정리의 중심 키워드: ${keyword}`,
+      body: `<p>선택한 톤: ${toneSelect.options[toneSelect.selectedIndex].text}</p><p>선택한 형식: ${formatSelect.options[formatSelect.selectedIndex].text}</p>`,
+    },
+    {
       kicker: "Keyword Lens",
       title: `"${keyword}"을 바라보는 현재적 관점`,
       body: toList(pattern.phenomenon),
@@ -320,55 +326,73 @@ async function detectStorageMode() {
   try {
     const response = await fetch("/api/storage-status");
     if (!response.ok) {
-      return "local";
+      return {
+        mode: "local",
+        message: "저장 상태를 확인하지 못해 현재 브라우저 저장으로 동작합니다.",
+      };
     }
 
     const payload = await response.json();
-    return payload.mode === "supabase" ? "supabase" : "local";
+    if (payload.ready && payload.mode === "supabase") {
+      return {
+        mode: "supabase",
+        message: "온라인 보관함이 연결되었습니다. 어떤 기기에서든 같은 URL로 같은 저장함을 볼 수 있습니다.",
+      };
+    }
+
+    return {
+      mode: "local",
+      message:
+        payload.error ||
+        "온라인 보관함 연결에 문제가 있어 현재 브라우저 저장으로 동작합니다.",
+    };
   } catch (error) {
-    return "local";
+    return {
+      mode: "local",
+      message: "저장 상태를 확인하지 못해 현재 브라우저 저장으로 동작합니다.",
+    };
   }
 }
 
-async function fetchRemoteSavedItems() {
-  const response = await fetch("/api/saved");
+async function fetchJson(url, options = {}, defaultErrorMessage = "요청에 실패했습니다.") {
+  const response = await fetch(url, options);
+  const payload = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || "온라인 보관함을 불러오지 못했습니다.");
+    throw new Error(payload.error || defaultErrorMessage);
   }
 
-  const payload = await response.json();
+  return payload;
+}
+
+async function fetchRemoteSavedItems() {
+  const payload = await fetchJson("/api/saved", {}, "온라인 보관함을 불러오지 못했습니다.");
   return payload.items || [];
 }
 
 async function createRemoteSavedItem(item) {
-  const response = await fetch("/api/saved", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
+  const payload = await fetchJson(
+    "/api/saved",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(item),
     },
-    body: JSON.stringify(item),
-  });
-
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || "온라인 저장에 실패했습니다.");
-  }
-
-  const payload = await response.json();
+    "온라인 저장에 실패했습니다."
+  );
   return payload.item;
 }
 
 async function deleteRemoteSavedItem(savedId) {
-  const response = await fetch(`/api/saved?id=${encodeURIComponent(savedId)}`, {
-    method: "DELETE",
-  });
-
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || "온라인 삭제에 실패했습니다.");
-  }
+  await fetchJson(
+    `/api/saved?id=${encodeURIComponent(savedId)}`,
+    {
+      method: "DELETE",
+    },
+    "온라인 삭제에 실패했습니다."
+  );
 }
 
 function summarizeSavedItem(item) {
@@ -519,6 +543,16 @@ function buildCardsForDisplay(savedState) {
   return [buildNewsCard({ status: "ready", items: savedState.newsItems }), ...savedState.cards];
 }
 
+function setLatestResultState(keyword, cards, newsItems = []) {
+  latestResultState = {
+    keyword,
+    tone: toneSelect.value,
+    format: formatSelect.value,
+    cards,
+    newsItems,
+  };
+}
+
 function renderCards(cards) {
   results.innerHTML = "";
 
@@ -543,17 +577,16 @@ function renderCards(cards) {
 }
 
 async function fetchNews(keyword) {
-  const response = await fetch(`/api/news?q=${encodeURIComponent(keyword)}`);
-
-  if (!response.ok) {
-    throw new Error("뉴스 서버가 응답하지 않았습니다.");
-  }
-
-  return response.json();
+  return fetchJson(
+    `/api/news?q=${encodeURIComponent(keyword)}`,
+    {},
+    "뉴스 서버가 응답하지 않았습니다."
+  );
 }
 
 async function generateIdeas() {
   const keyword = keywordInput.value.trim();
+  const generationId = ++activeGenerationId;
 
   if (!keyword) {
     renderCards([
@@ -569,23 +602,15 @@ async function generateIdeas() {
 
   const baseCards = buildCards(keyword, toneSelect.value, formatSelect.value);
   renderCards([buildNewsCard({ status: "loading", items: [] }), ...baseCards]);
-  latestResultState = {
-    keyword,
-    tone: toneSelect.value,
-    format: formatSelect.value,
-    cards: baseCards,
-    newsItems: [],
-  };
+  setLatestResultState(keyword, baseCards, []);
 
   try {
     const newsData = await fetchNews(keyword);
-    latestResultState = {
-      keyword,
-      tone: toneSelect.value,
-      format: formatSelect.value,
-      cards: baseCards,
-      newsItems: newsData.items || [],
-    };
+    if (generationId !== activeGenerationId) {
+      return;
+    }
+
+    setLatestResultState(keyword, baseCards, newsData.items || []);
 
     renderCards([
       buildNewsCard({
@@ -595,13 +620,11 @@ async function generateIdeas() {
       ...baseCards,
     ]);
   } catch (error) {
-    latestResultState = {
-      keyword,
-      tone: toneSelect.value,
-      format: formatSelect.value,
-      cards: baseCards,
-      newsItems: [],
-    };
+    if (generationId !== activeGenerationId) {
+      return;
+    }
+
+    setLatestResultState(keyword, baseCards, []);
 
     renderCards([
       buildNewsCard({
@@ -645,7 +668,19 @@ async function saveCurrentResult() {
 }
 
 async function openSavedItem(savedId) {
-  const sourceItems = storageMode === "supabase" ? await fetchRemoteSavedItems() : getSavedItems();
+  let sourceItems = [];
+
+  if (storageMode === "supabase") {
+    try {
+      sourceItems = await fetchRemoteSavedItems();
+    } catch (error) {
+      updateSaveStatus(error.message || "온라인 보관함을 불러오지 못했습니다.");
+      return;
+    }
+  } else {
+    sourceItems = getSavedItems();
+  }
+
   const item = sourceItems.find((entry) => entry.id === savedId);
 
   if (!item) {
@@ -722,13 +757,9 @@ savedLibrary.addEventListener("click", (event) => {
 });
 
 async function initializeApp() {
-  storageMode = await detectStorageMode();
-
-  if (storageMode === "supabase") {
-    updateSaveStatus("온라인 보관함이 연결되었습니다. 어떤 기기에서든 같은 URL로 같은 저장함을 볼 수 있습니다.");
-  } else {
-    updateSaveStatus("Supabase 연결 전이라 지금은 이 브라우저 안에만 저장됩니다.");
-  }
+  const storageStatus = await detectStorageMode();
+  storageMode = storageStatus.mode;
+  updateSaveStatus(storageStatus.message);
 
   keywordInput.value = "딥페이크";
   await renderSavedLibrary();
